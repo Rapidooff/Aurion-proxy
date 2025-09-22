@@ -1,3 +1,20 @@
-node_modules
+# Node
+node_modules/
+npm-debug.log*
+yarn.lock
+
+# Env & secrets
 .env
+.env.*
+*.key
+*.pem
+
+# DB locale (mémoire Aurion)
+fact_store.db
+
+# OS junk
+.DS_Store
+
+# Logs
+logs/
 *.log
