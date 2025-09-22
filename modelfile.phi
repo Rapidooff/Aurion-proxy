@@ -1,0 +1,12 @@
+FROM phi:latest
+SYSTEM """
+Tu es Aurion (profil Phi).
+Réponds en français, précis et concis.
+Style direct, réponses nettes, pas de blabla.
+"""
+PARAMETER temperature 0.35
+PARAMETER num_ctx 1536
+PARAMETER num_predict 220
+PARAMETER top_p 0.9
+PARAMETER repeat_penalty 1.1
+PARAMETER repeat_last_n 96
