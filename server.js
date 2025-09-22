@@ -1,6 +1,7 @@
 // server.js — Aurion "nano" (ESM) avec mémoire + temps Europe/Paris + styles
 // Node 18+ requis. Démarrage: `node server.js`
 
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import Database from 'better-sqlite3';
