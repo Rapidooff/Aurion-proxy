@@ -1,5 +1,7 @@
-// server.js — Aurion "nano" (ESM) avec mémoire + temps Europe/Paris + styles
-// Node 18+ requis. Démarrage: `node server.js`
+// server.js — Aurion Proxy (ESM) full power
+// Run: node server.js  (Node 18+)
+// Features: mémoire locale (SQLite + embeddings), horloge Europe/Paris, styles,
+// intents heure/date, /aurion, /aurion_stream (buffer NDJSON), /aurion_once, /aurion_smart
 
 import 'dotenv/config';
 import express from 'express';
@@ -8,9 +10,10 @@ import Database from 'better-sqlite3';
 import { Buffer } from 'node:buffer';
 
 // ---------- CONFIG ----------
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://localhost:11434';
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'gemma3:1b';
+// Accepte OLLAMA_MODEL ou AURION_MODEL (fallback)
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || process.env.AURION_MODEL || 'gemma3:1b';
 const EMBED_MODEL = process.env.EMBED_MODEL || 'nomic-embed-text';
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY || ''; // facultatif
 const FACT_SIM_THRESHOLD = Number(process.env.FACT_SIM_THRESHOLD || 0.85);
@@ -59,6 +62,7 @@ function parisNow() {
   const time = new Intl.DateTimeFormat('fr-FR', {
     timeZone: tz, hour: '2-digit', minute: '2-digit', second: '2-digit'
   }).format(now);
+  // ISO alignée sur le TZ pour logs
   const iso = new Date(now.toLocaleString('en-US', { timeZone: tz })).toISOString();
   return { tz, date, time, iso, epoch: now.getTime() };
 }
@@ -69,11 +73,11 @@ function timeSummary() {
 
 // ---------- Styles de réponses pour l'heure/date ----------
 const replyStyles = {
-  'sobre': ({ dateLine }) => `Nous sommes le ${dateLine}.`,
-  'friendly': ({ dateLine }) => `On est le ${dateLine} 😉`,
-  'genz': ({ dateLine }) => `Mise à jour IRL: ${dateLine} — on est synchro. ⏱️`,
-  'pro': ({ dateLine }) => `Contexte temporel: ${dateLine}.`,
-  'aurion': ({ dateLine }) => `Horloge synchronisée: ${dateLine}. Prêt à exécuter.`,
+  'sobre':   ({ dateLine }) => `Nous sommes le ${dateLine}.`,
+  'friendly':({ dateLine }) => `On est le ${dateLine} 😉`,
+  'genz':    ({ dateLine }) => `Mise à jour IRL: ${dateLine} — synchro ok. ⏱️`,
+  'pro':     ({ dateLine }) => `Contexte temporel: ${dateLine}.`,
+  'aurion':  ({ dateLine }) => `Horloge synchronisée: ${dateLine}. Prêt à exécuter.`,
 };
 function renderTimeAnswer(style = 'aurion') {
   const n = parisNow();
@@ -240,7 +244,7 @@ app.get('/health', async (_req, res) => {
     ok: true,
     model: OLLAMA_MODEL,
     ollama,
-    tavily: TAVILY_API_KEY ? 'configured' : 'not_configured',
+    tavily: TAVILY_API_KEY ? 'configured' : 'off',
     time: {
       iso: new Date().toISOString(),
       human: timeSummary(),
@@ -249,13 +253,11 @@ app.get('/health', async (_req, res) => {
   });
 });
 
-// Horloge directe (utile pour debug/app)
 app.get('/now', (_req, res) => {
   const n = parisNow();
   res.json({ ok: true, now: n, human: `${n.date} — ${n.time} (${n.tz})` });
 });
 
-// Enregistrer/mettre à jour une correction
 app.post('/feedback', async (req, res) => {
   try {
     const { question, correct_answer, source, ttl_days } = req.body || {};
@@ -270,7 +272,6 @@ app.post('/feedback', async (req, res) => {
   }
 });
 
-// Oublier un fait
 app.post('/forget', (req, res) => {
   const { question } = req.body || {};
   if (!question) return res.status(400).json({ ok:false, error:'question requise' });
@@ -278,7 +279,6 @@ app.post('/forget', (req, res) => {
   res.json({ ok });
 });
 
-// Inspection des faits
 app.get('/facts', (req, res) => {
   const q = req.query.q || '';
   if (!q) {
@@ -294,18 +294,16 @@ app.get('/facts', (req, res) => {
   res.json({ ok:true, found:true, item: row });
 });
 
-// Aurion — avec short-circuit heure/date + FactStore + contexte temps
+// ---- /aurion : time intent -> FactStore -> LLM (avec contexte temps) ----
 app.post('/aurion', async (req, res) => {
   try {
     const { prompt, system, temperature, maxTokens, style = 'aurion' } = req.body || {};
     if (!prompt) return res.status(400).json({ error:'prompt requis' });
 
-    // 0) Question d'heure/date → réponse directe stylée
     if (isTimeQuery(prompt)) {
       return res.json({ reply: renderTimeAnswer(style), meta: { mode:'time', style, now: parisNow() } });
     }
 
-    // 1) FactStore
     const hit = await lookupFact(prompt);
     if (hit) {
       return res.json({
@@ -314,7 +312,6 @@ app.post('/aurion', async (req, res) => {
       });
     }
 
-    // 2) LLM avec contexte temporel
     const nowLine = `Contexte actuel: ${timeSummary()}. Réponds en cohérence avec cette date/heure (Europe/Paris).`;
     const finalSystem = [system || '', nowLine].filter(Boolean).join('\n');
     const reply = await askLLM(
@@ -323,46 +320,109 @@ app.post('/aurion', async (req, res) => {
       Number(temperature ?? 0.6),
       Number(maxTokens ?? 512)
     );
-    res.json({ reply, meta:{ mode:'llm' } });
+    res.json({ reply: (reply || '').trim(), meta:{ mode:'llm' } });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// Aurion stream — mêmes règles (time + fact) puis stream LLM avec contexte temps
-app.post('/aurion_stream', async (req, res) => {
+// ---- /aurion_once : réponse non-stream, toujours “une phrase”/bloc complet ----
+app.post('/aurion_once', async (req, res) => {
   try {
-    const { prompt, system, temperature, style = 'aurion' } = req.body || {};
+    const { prompt, system, temperature, maxTokens = 256, style = 'aurion' } = req.body || {};
     if (!prompt) return res.status(400).json({ error:'prompt requis' });
 
     if (isTimeQuery(prompt)) {
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      return res.end(JSON.stringify({
-        reply: renderTimeAnswer(style),
-        meta: { mode:'time', style, now: parisNow() }
-      }));
+      return res.json({ reply: renderTimeAnswer(style), meta: { mode:'time', style, now: parisNow() } });
     }
 
     const hit = await lookupFact(prompt);
     if (hit) {
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      return res.end(JSON.stringify({
-        reply: hit.answer,
-        meta: { mode:'fact', confidence: hit.sim, source: hit.source, cache:'FactStore', updated_at: hit.updated_at }
-      }));
+      return res.json({ reply: hit.answer, meta: { mode:'fact', confidence: hit.sim, source: hit.source } });
     }
 
     const nowLine = `Contexte actuel: ${timeSummary()}. Réponds en cohérence avec cette date/heure (Europe/Paris).`;
     const finalSystem = [system || '', nowLine].filter(Boolean).join('\n');
+    const reply = await askLLM(prompt, finalSystem, Number(temperature ?? 0.6), Number(maxTokens));
+
+    res.json({ reply: (reply || '').trim(), meta: { mode:'llm' } });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---- /aurion_stream : stream NDJSON ou buffer complet fiable ----
+app.post('/aurion_stream', async (req, res) => {
+  try {
+    const { prompt, system, temperature, style = 'aurion', buffer = false } = req.body || {};
+    if (!prompt) return res.status(400).json({ error:'prompt requis' });
+
+    // time intent -> direct
+    if (isTimeQuery(prompt)) {
+      const out = renderTimeAnswer(style);
+      if (buffer) {
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        return res.end(JSON.stringify({ reply: out, meta: { mode:'time', style, now: parisNow(), buffered: true } }));
+      }
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      return res.end(out);
+    }
+
+    // FactStore
+    const hit = await lookupFact(prompt);
+    if (hit) {
+      const payload = {
+        reply: hit.answer,
+        meta: { mode:'fact', confidence: hit.sim, source: hit.source, cache:'FactStore', updated_at: hit.updated_at }
+      };
+      if (buffer) {
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        return res.end(JSON.stringify({ ...payload, buffered: true }));
+      }
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      return res.end(hit.answer);
+    }
+
+    // LLM stream
+    const nowLine = `Contexte actuel: ${timeSummary()}. Réponds en cohérence avec cette date/heure (Europe/Paris).`;
+    const finalSystem = [system || '', nowLine].filter(Boolean).join('\n');
     const r = await streamLLM(prompt, finalSystem, Number(temperature ?? 0.6));
 
-    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
+    if (buffer) {
+      // Accumule le NDJSON proprement (Node 18+/20: chunks = Uint8Array)
+      const decoder = new TextDecoder();
+      let carry = '';
+      let full = '';
+      for await (const chunk of r.body) {
+        const text = decoder.decode(chunk, { stream: true });
+        carry += text;
+        let idx;
+        while ((idx = carry.indexOf('\n')) >= 0) {
+          const line = carry.slice(0, idx).trim();
+          carry = carry.slice(idx + 1);
+          if (!line) continue;
+          try {
+            const obj = JSON.parse(line);
+            if (obj.response) full += obj.response;
+          } catch { /* ignore malformed split; handled by carry buffer */ }
+        }
+      }
+      if (carry.trim()) {
+        try {
+          const last = JSON.parse(carry.trim());
+          if (last.response) full += last.response;
+        } catch { /* ignore tail */ }
+      }
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      return res.end(JSON.stringify({ reply: full.trim(), meta: { mode:'llm', buffered: true } }));
+    }
 
+    // Mode stream brut (NDJSON)
+    res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
     for await (const chunk of r.body) {
-      res.write(chunk); // NDJSON direct de Ollama
+      res.write(chunk); // NDJSON via Ollama
     }
     res.end();
   } catch (e) {
@@ -371,13 +431,12 @@ app.post('/aurion_stream', async (req, res) => {
   }
 });
 
-// Aurion smart — FactStore d'abord, sinon (optionnel) web + LLM avec contexte temps
+// ---- /aurion_smart : FactStore -> (optionnel) Web -> LLM (contexte temps) ----
 app.post('/aurion_smart', async (req, res) => {
   try {
     const { prompt, reliability = 'normal', style = 'paragraph', system } = req.body || {};
     if (!prompt) return res.status(400).json({ error:'prompt requis' });
 
-    // FactStore prioritaire
     const hit = await lookupFact(prompt);
     if (hit) {
       return res.json({
@@ -417,7 +476,7 @@ app.post('/aurion_smart', async (req, res) => {
     }
 
     res.json({
-      reply: draft,
+      reply: (draft || '').trim(),
       meta: {
         mode: web ? 'web+llm' : 'llm',
         sources: web?.results?.slice(0,3)?.map(r => ({ title: r.title, url: r.url })) || [],
