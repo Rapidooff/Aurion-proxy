@@ -1,488 +1,282 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// AURION PROXY — Express + Ollama (Gemma/Phi) + Tavily + APNS (iOS commands)
-// Rapide, robuste, switch de modèle in-app, recherche web, smart routing,
-// push iOS pour exécuter des commandes, et horloge Europe/Paris.
-// ─────────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────
+// AURION PROXY v1.2 — Factual Mode (no BS)
+// ──────────────────────────────────────────────────────────────
+import express from 'express';
+import cors from 'cors';
+try { (await import('dotenv')).config(); } catch {}
 
-/*
-ENV attendus (.env) — exemples :
-PORT=3000
-OLLAMA_HOST=http://localhost:11434
-AURION_MODEL=aurion-gemma
-TAVILY_API_KEY=tvly_xxx
-
-# APNS pour push vers ton app iOS (pour exécuter des commandes côté téléphone)
-APNS_TEAM_ID=XXXXXXXXXX
-APNS_KEY_ID=YYYYYYYYYY
-APNS_BUNDLE_ID=com.rapido.aurion
-APNS_PRIVATE_KEY_BASE64=...    (contenu base64 d'un .p8 ENTIER, sans retour ligne)
-APNS_SANDBOX=true              (true = environnement de dev)
-*/
-
-const express = require('express');
-const cors = require('cors');
-const http2 = require('http2');
-const jwt = require('jsonwebtoken');
-
-// charge .env si présent
-try { require('dotenv').config(); } catch {}
-
-// ── App & middlewares
 const app = express();
-app.use(cors({ origin: true }));
-app.use(express.json({ limit: '2mb' }));
 
-// ── Config (env > défauts)
+// — Config
 const PORT = Number(process.env.PORT || 3000);
 const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://localhost:11434';
-const DEFAULT_MODEL = process.env.AURION_MODEL || 'aurion-gemma';
-const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 120000);
+const AURION_MODEL = process.env.AURION_MODEL || 'aurion-gemma';
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY || '';
 const TZ = 'Europe/Paris';
 
-// APNS (optionnels)
-const APNS_TEAM_ID = process.env.APNS_TEAM_ID || '';
-const APNS_KEY_ID = process.env.APNS_KEY_ID || '';
-const APNS_BUNDLE_ID = process.env.APNS_BUNDLE_ID || '';
-const APNS_PRIVATE_KEY_BASE64 = process.env.APNS_PRIVATE_KEY_BASE64 || '';
-const APNS_SANDBOX = String(process.env.APNS_SANDBOX || 'true').toLowerCase() === 'true';
-
-// ── Utils
-const log = (...args) => console.log(new Date().toISOString(), '-', ...args);
-
-function nowParis() {
-  const d = new Date();
-  const fmt = new Intl.DateTimeFormat('fr-FR', {
-    timeZone: TZ, dateStyle: 'full', timeStyle: 'medium'
-  }).format(d);
-  return {
-    iso: new Date(d.toLocaleString('en-US', { timeZone: TZ })).toISOString(),
-    human: fmt,
-    tz: TZ,
-  };
-}
-
-// Timeouts pour fetch
-async function fetchWithTimeout(url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } finally {
-    clearTimeout(id);
-  }
-}
-
-// Modèle courant (réagit à /set_model)
-function getCurrentModel() {
-  return process.env.AURION_MODEL || DEFAULT_MODEL;
-}
-
-// Heuristique : faut-il “naviguer” (Tavily) ?
-// Si la requête semble récente/sensible (news, prix, lois, “aujourd’hui”, “dernier”, “2025”, etc.)
-function shouldBrowse(q = '') {
-  const s = q.toLowerCase();
-  const triggers = [
-    'aujourd\'hui','hier','demain','derni', // dernier/dernière
-    'actu','actualité','news','nouveau','mise à jour','changelog',
-    'prix','tarif','loi','règlement','horaire','match','score',
-    'programme','planning','disponible','sortie','release',
-    'version','ios','android','macos','windows','kernel',
-    '2023','2024','2025','2026','septembre','octobre','novembre','décembre'
-  ];
-  return triggers.some(t => s.includes(t));
-}
-
-// Réponse courte par défaut (safe) si l’app ne force rien
-const DEFAULT_OPTIONS = {
-  temperature: 0.3,
-  top_p: 0.9,
+// — Defaults “safe”
+const BASE_OPTIONS = {
+  temperature: 0.2, // ↓ créativité
+  top_p: 0.85,
+  repeat_penalty: 1.15,
+  repeat_last_n: 128,
   num_ctx: 1536,
-  num_predict: 200,
-  repeat_penalty: 1.1,
-  repeat_last_n: 96,
+  num_predict: 300,
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Root & Health
-// ─────────────────────────────────────────────────────────────────────────────
+// — Express
+app.use(cors({ origin: true }));
+app.use(express.json({ limit: '2mb' }));
 
-app.get('/', (_req, res) => res.send('Aurion proxy is running'));
+// — Time helper
+function nowParis() {
+  const d = new Date();
+  const iso = new Date(d.toLocaleString('en-US', { timeZone: TZ })).toISOString();
+  const human = new Intl.DateTimeFormat('fr-FR', { timeZone: TZ, dateStyle: 'full', timeStyle: 'medium' }).format(d);
+  return { iso, human, tz: TZ };
+}
 
+// — Guardrail system (FR)
+const GUARDRAIL_SYSTEM = `
+Tu es **Aurion**, assistant factuel et fiable. Règles ABSOLUES :
+1) **Pas de spéculation**. Si tu n'es pas certain, dis-le clairement: "Je ne sais pas avec certitude" et propose une recherche.
+2) **Toujours le contexte temporel** quand utile (dates précises, "au 22 septembre 2025").
+3) **Structure claire**, concise, étape par étape si nécessaire.
+4) **Citations** si tu as utilisé des sources (format: [1] [2] avec domaines).
+5) **Zéro invention** de chiffres, personnes, lois, prix, API, endpoints.
+6) Si la question est ambiguë, répond au cas le plus probable en le signalant ET propose l'alternative en 1 ligne.
+`;
+
+// — Heuristique : faut-il naviguer ?
+function shouldBrowse(q = '') {
+  const s = q.toLowerCase();
+  return [
+    'aujourd\'hui','hier','demain','derni','actu','news','rumeur','breaking','nouveau','maj','update',
+    'prix','tarif','loi','décret','score','résultat','classement',
+    'version','release','roadmap','changelog',
+    '2024','2025','septembre','octobre','novembre','décembre'
+  ].some(t => s.includes(t));
+}
+
+// — Fetch w/ timeout
+async function fwt(url, init = {}, timeoutMs = 20000) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), timeoutMs);
+  try { return await fetch(url, { ...init, signal: ctl.signal }); }
+  finally { clearTimeout(t); }
+}
+
+// — /health
 app.get('/health', async (_req, res) => {
   let ollama = 'down';
   try {
-    const r = await fetchWithTimeout(`${OLLAMA_HOST}/api/tags`, { method: 'GET' }, 5000);
+    const r = await fwt(`${OLLAMA_HOST}/api/tags`, {}, 5000);
     if (r.ok) ollama = 'up';
   } catch {}
-  const tavily = TAVILY_API_KEY ? 'configured' : 'missing_key';
-  const time = nowParis();
-  res.json({ ok: true, model: getCurrentModel(), ollama, tavily, time });
+  res.json({ ok: true, model: AURION_MODEL, ollama, tavily: TAVILY_API_KEY ? 'configured' : 'missing_key', time: nowParis() });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// OLLAMA — NON-STREAM
-// body: { prompt, system?, options?, model? }
-// ─────────────────────────────────────────────────────────────────────────────
+// — Basique non-stream (garde-fous activés)
 app.post('/aurion', async (req, res) => {
-  const { prompt, system, options, model } = req.body || {};
-  if (!prompt || typeof prompt !== 'string') {
-    return res.status(400).json({ error: 'Missing prompt (string expected)' });
-  }
-  const finalModel = (model && String(model)) || getCurrentModel();
+  const { prompt, options = {}, model } = req.body || {};
+  if (!prompt || typeof prompt !== 'string') return res.status(400).json({ error: 'Missing prompt' });
+  const finalModel = String(model || AURION_MODEL);
+
   const body = {
     model: finalModel,
     prompt,
+    system: GUARDRAIL_SYSTEM,
     stream: false,
-    ...(system ? { system } : {}),
-    options: { ...DEFAULT_OPTIONS, ...(options || {}) },
+    options: { ...BASE_OPTIONS, ...options },
   };
 
   try {
-    log('> /aurion', { model: finalModel, len: prompt.length });
-    const r = await fetchWithTimeout(`${OLLAMA_HOST}/api/generate`, {
+    const r = await fwt(`${OLLAMA_HOST}/api/generate`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+      body: JSON.stringify(body)
+    }, 120000);
 
     if (!r.ok) {
-      const text = await r.text().catch(() => '');
-      log('! Ollama error', r.status, text.slice(0, 300));
-      return res.status(502).json({ error: 'Ollama error', status: r.status, detail: text });
+      const txt = await r.text().catch(() => '');
+      return res.status(502).json({ error: 'Ollama error', detail: txt.slice(0, 500) });
     }
-
-    const data = await r.json();
-    return res.json({
-      reply: data.response || '',
-      model: finalModel,
-      metrics: {
-        total_duration: data.total_duration,
-        eval_count: data.eval_count,
-        eval_duration: data.eval_duration,
-        load_duration: data.load_duration,
-        prompt_eval_count: data.prompt_eval_count,
-      },
-    });
+    const j = await r.json();
+    res.json({ reply: j.response || '', model: finalModel });
   } catch (e) {
-    const code = e?.name === 'AbortError' ? 504 : 500;
-    log('! Proxy error /aurion', e?.name || '', e?.message || e);
-    return res.status(code).json({ error: 'Proxy error', detail: String(e) });
+    res.status(e?.name === 'AbortError' ? 504 : 500).json({ error: 'Proxy error', detail: String(e) });
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// OLLAMA — STREAM (texte progressif)
-// ─────────────────────────────────────────────────────────────────────────────
+// — STREAM (garde-fous activés)
 app.post('/aurion_stream', async (req, res) => {
-  const { prompt, system, options, model } = req.body || {};
+  const { prompt, options = {}, model } = req.body || {};
   if (!prompt || typeof prompt !== 'string') {
     res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
-    return res.end('Missing prompt (string expected)');
+    return res.end('Missing prompt');
   }
-  const finalModel = (model && String(model)) || getCurrentModel();
+  const finalModel = String(model || AURION_MODEL);
+
+  const body = {
+    model: finalModel,
+    prompt,
+    system: GUARDRAIL_SYSTEM,
+    stream: true,
+    options: { ...BASE_OPTIONS, ...options },
+  };
 
   try {
-    log('> /aurion_stream', { model: finalModel, len: prompt.length });
-
-    const r = await fetchWithTimeout(`${OLLAMA_HOST}/api/generate`, {
+    const r = await fwt(`${OLLAMA_HOST}/api/generate`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: finalModel, prompt, stream: true,
-        ...(system ? { system } : {}),
-        options: { ...DEFAULT_OPTIONS, ...(options || {}) },
-      }),
-    });
+      body: JSON.stringify(body)
+    }, 120000);
 
     if (!r.ok || !r.body) {
-      const text = await r.text().catch(() => '');
+      const txt = await r.text().catch(() => '');
       res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-      return res.end(`Ollama error: ${text}`);
+      return res.end(`Ollama error: ${txt.slice(0, 500)}`);
     }
 
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-
     const reader = r.body.getReader();
-    const decoder = new TextDecoder();
-    let totalChars = 0;
-
+    const dec = new TextDecoder();
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
-      const chunk = decoder.decode(value, { stream: true });
+      const chunk = dec.decode(value, { stream: true });
       for (const line of chunk.split('\n').filter(Boolean)) {
         try {
           const json = JSON.parse(line);
-          if (json.response) { totalChars += json.response.length; res.write(json.response); }
-          if (json.done) { log('< /aurion_stream done', { totalChars }); return res.end(); }
-        } catch { /* ignore fragments */ }
+          if (json.response) res.write(json.response);
+          if (json.done) return res.end();
+        } catch {}
       }
     }
     res.end();
   } catch (e) {
-    const msg = e?.name === 'AbortError' ? 'Proxy timeout' : `Proxy error: ${String(e)}`;
     res.writeHead(e?.name === 'AbortError' ? 504 : 500, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end(msg);
+    res.end('Proxy error');
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MODEL SWITCH — /set_model { model: "aurion-gemma" | "aurion-phi" }
-// ─────────────────────────────────────────────────────────────────────────────
-app.post('/set_model', (req, res) => {
-  const { model } = req.body || {};
-  if (!model || typeof model !== 'string') {
-    return res.status(400).json({ error: 'Missing model (string expected)' });
-  }
-  process.env.AURION_MODEL = model;
-  log('> Model switched to', model);
-  res.json({ ok: true, model });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TAVILY — /search (brut) et /answer (search → résumé par LLM)
-// ─────────────────────────────────────────────────────────────────────────────
+// — Tavily raw
 app.post('/search', async (req, res) => {
+  if (!TAVILY_API_KEY) return res.status(400).json({ error: 'Missing TAVILY_API_KEY' });
+  const { q, query, search_depth = 'advanced', max_results = 5, include_answer = true } = req.body || {};
+  const finalQ = (q || query || '').toString().trim();
+  if (!finalQ) return res.status(400).json({ error: 'Missing query' });
+
   try {
-    if (!TAVILY_API_KEY) return res.status(400).json({ error: 'Missing TAVILY_API_KEY' });
-    const {
-      q, query, search_depth = 'basic', include_answer = true,
-      max_results = 5, include_images = false, include_domains, exclude_domains
-    } = req.body || {};
-    const finalQuery = (q || query || '').toString().trim();
-    if (!finalQuery) return res.status(400).json({ error: 'Missing query (q or query)' });
-
-    const body = {
-      api_key: TAVILY_API_KEY,
-      query: finalQuery, search_depth, include_answer, max_results, include_images,
-      ...(Array.isArray(include_domains) ? { include_domains } : {}),
-      ...(Array.isArray(exclude_domains) ? { exclude_domains } : {}),
-    };
-
-    log('> /search tavily', { q: finalQuery.slice(0, 80), max_results, search_depth });
-    const r = await fetchWithTimeout('https://api.tavily.com/search', {
+    const r = await fwt('https://api.tavily.com/search', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ api_key: TAVILY_API_KEY, query: finalQ, search_depth, include_answer, max_results, include_images: false })
     }, 20000);
-
-    if (!r.ok) {
-      const text = await r.text().catch(() => '');
-      log('! Tavily error', r.status, text.slice(0, 300));
-      return res.status(502).json({ error: 'Tavily error', status: r.status, detail: text });
-    }
-
+    if (!r.ok) return res.status(502).json({ error: 'Tavily error', status: r.status, detail: await r.text() });
     const data = await r.json();
-    return res.json({ ok: true, ...data });
+    res.json({ ok: true, ...data });
   } catch (e) {
-    const code = e?.name === 'AbortError' ? 504 : 500;
-    log('! Proxy error /search', e?.name || '', e?.message || e);
-    return res.status(code).json({ error: 'Proxy error', detail: String(e) });
+    res.status(e?.name === 'AbortError' ? 504 : 500).json({ error: 'Proxy error', detail: String(e) });
   }
 });
 
-// /answer : { q: "...", style?: "bullets"|"short"|"long", max_results?, search_depth? }
+// — Réponse FIABLE (Tavily -> synthèse avec citations)
 app.post('/answer', async (req, res) => {
-  const { q, style = 'bullets', max_results = 5, search_depth = 'advanced' } = req.body || {};
-  if (!q || typeof q !== 'string') return res.status(400).json({ error: 'Missing q (string)' });
   if (!TAVILY_API_KEY) return res.status(400).json({ error: 'Missing TAVILY_API_KEY' });
+  const { q, style = 'bullets', max_results = 6, search_depth = 'advanced' } = req.body || {};
+  if (!q || typeof q !== 'string') return res.status(400).json({ error: 'Missing q' });
 
   try {
-    // 1) Recherche Tavily
-    const sr = await fetchWithTimeout('https://api.tavily.com/search', {
+    const sr = await fwt('https://api.tavily.com/search', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        api_key: TAVILY_API_KEY, query: q, search_depth, include_answer: true,
-        max_results, include_images: false
-      }),
+      body: JSON.stringify({ api_key: TAVILY_API_KEY, query: q, search_depth, include_answer: true, max_results, include_images: false }),
     }, 20000);
-    if (!sr.ok) {
-      const text = await sr.text().catch(() => '');
-      return res.status(502).json({ error: 'Tavily error', detail: text });
-    }
+    if (!sr.ok) return res.status(502).json({ error: 'Tavily error', detail: await sr.text() });
     const data = await sr.json();
 
-    // 2) Construit un contexte compact pour le LLM
-    const context = [
-      data.answer ? `Réponse Tavily: ${data.answer}` : '',
-      ...(Array.isArray(data.results) ? data.results.slice(0, max_results).map(r =>
-        `• ${r.title || ''}\n${r.content || ''}`) : [])
-    ].filter(Boolean).join('\n\n');
+    const blocks = [];
+    if (data.answer) blocks.push(`Résumé Tavily:\n${data.answer}`);
+    if (Array.isArray(data.results)) {
+      data.results.slice(0, max_results).forEach((r, i) => {
+        blocks.push(`[${i+1}] ${r.title || r.url}\n${r.content || ''}\n(${new URL(r.url).hostname})`);
+      });
+    }
+    const context = blocks.join('\n\n');
 
-    // 3) Demande au LLM de synthétiser
+    const styleLine =
+      style === 'short'  ? 'Format: 1 court paragraphe.' :
+      style === 'bullets'? 'Format: 4–6 puces nettes.' :
+                           'Format: synthèse concise.';
+
     const prompt = [
-      'Tu es Aurion. Utilise UNIQUEMENT les informations ci-dessous (contexte).',
-      'Réponds en français, précis, et cite si nécessaire les sources en fin de réponse (titres courts).',
-      style === 'bullets' ? 'Format: 4–6 puces concises.' :
-      style === 'short' ? 'Format: 1 paragraphe court.' :
-      'Format: synthèse développée, claire.',
+      GUARDRAIL_SYSTEM,
       '',
-      '=== CONTEXTE ===',
+      '=== CONTEXTE (sources) ===',
       context,
+      '',
+      '=== CONSIGNES ===',
+      '- Réponds UNIQUEMENT en t’appuyant sur les sources ci-dessus.',
+      '- Si les sources sont insuffisantes/contradictoires → dis-le et propose une recherche supplémentaire.',
+      '- Termine par une ligne "Sources: [1] [2] …" avec numéros pertinents.',
+      styleLine,
       '',
       '=== QUESTION ===',
       q
     ].join('\n');
 
-    const finalModel = getCurrentModel();
-    const r2 = await fetchWithTimeout(`${OLLAMA_HOST}/api/generate`, {
+    const r2 = await fwt(`${OLLAMA_HOST}/api/generate`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: finalModel, prompt,
-        stream: false, options: { ...DEFAULT_OPTIONS, num_predict: 400 }
-      }),
-    });
+      body: JSON.stringify({ model: AURION_MODEL, prompt, stream: false, options: { ...BASE_OPTIONS, num_predict: 450 } }),
+    }, 120000);
 
-    if (!r2.ok) {
-      const text = await r2.text().catch(() => '');
-      return res.status(502).json({ error: 'Ollama error', detail: text });
-    }
-
+    if (!r2.ok) return res.status(502).json({ error: 'Ollama error', detail: await r2.text() });
     const out = await r2.json();
-    return res.json({ ok: true, reply: out.response || '', model: finalModel });
+    res.json({ ok: true, reply: out.response || '', model: AURION_MODEL });
   } catch (e) {
-    const code = e?.name === 'AbortError' ? 504 : 500;
-    log('! Proxy error /answer', e?.name || '', e?.message || e);
-    return res.status(code).json({ error: 'Proxy error', detail: String(e) });
+    res.status(e?.name === 'AbortError' ? 504 : 500).json({ error: 'Proxy error', detail: String(e) });
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// /aurion_smart : route qui choisit toute seule (LLM direct vs Tavily)
-// body: { prompt, forceWeb?: boolean, reliability?: "high"|"default", style? }
-// ─────────────────────────────────────────────────────────────────────────────
+// — Route “intelligente” : choisit automatique
 app.post('/aurion_smart', async (req, res) => {
-  const { prompt, forceWeb = false, reliability = 'default', style = 'bullets', options, model } = req.body || {};
-  if (!prompt || typeof prompt !== 'string') {
-    return res.status(400).json({ error: 'Missing prompt (string expected)' });
-  }
+  const { prompt, reliability = 'default', forceWeb = false, style = 'bullets', options = {} } = req.body || {};
+  if (!prompt || typeof prompt !== 'string') return res.status(400).json({ error: 'Missing prompt' });
 
-  const mustWeb = forceWeb || shouldBrowse(prompt) || reliability === 'high';
-  if (mustWeb && TAVILY_API_KEY) {
-    // délègue à /answer
+  const mustWeb = forceWeb || reliability === 'high' || shouldBrowse(prompt);
+  if (mustWeb) {
+    if (!TAVILY_API_KEY) {
+      return res.status(412).json({ // precondition failed
+        error: 'high_reliability_requires_web',
+        detail: 'Tavily manquant — je préfère ne pas inventer. Active TAVILY_API_KEY.'
+      });
+    }
+    // Déroute vers /answer (sources+citation)
     req.body = { q: prompt, style };
     return app._router.handle(req, res, app._router.stack.find(l => l.route && l.route.path === '/answer').route.stack[0].handle);
   }
 
-  // Sinon: direct LLM (non-stream) avec options safe
-  const finalModel = (model && String(model)) || getCurrentModel();
+  // Sinon, réponse locale avec garde-fous
   try {
-    const r = await fetchWithTimeout(`${OLLAMA_HOST}/api/generate`, {
+    const r = await fwt(`${OLLAMA_HOST}/api/generate`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: finalModel, prompt, stream: false,
-        options: { ...DEFAULT_OPTIONS, ...(options || {}) }
-      }),
-    });
-    if (!r.ok) {
-      const text = await r.text().catch(() => '');
-      return res.status(502).json({ error: 'Ollama error', detail: text });
-    }
-    const out = await r.json();
-    return res.json({ ok: true, reply: out.response || '', model: finalModel });
+      body: JSON.stringify({ model: AURION_MODEL, prompt, system: GUARDRAIL_SYSTEM, stream: false, options: { ...BASE_OPTIONS, ...options } }),
+    }, 120000);
+    if (!r.ok) return res.status(502).json({ error: 'Ollama error', detail: await r.text() });
+    const j = await r.json();
+    res.json({ ok: true, reply: j.response || '', model: AURION_MODEL });
   } catch (e) {
-    const code = e?.name === 'AbortError' ? 504 : 500;
-    log('! Proxy error /aurion_smart', e?.name || '', e?.message || e);
-    return res.status(code).json({ error: 'Proxy error', detail: String(e) });
+    res.status(e?.name === 'AbortError' ? 504 : 500).json({ error: 'Proxy error', detail: String(e) });
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// APNS — envoyer des commandes à l'app iOS (ton app exécute côté device)
-// /notify : push simple
-// /phone_command : push avec payload { type: "...", args: {...} }
-// L'app iOS doit interpréter le payload et exécuter (ouvrir app, lancer nav,
-// domotique, rappeler quelqu’un, activer un mode, etc.).
-// ─────────────────────────────────────────────────────────────────────────────
-
-function apnsIsConfigured() {
-  return Boolean(APNS_TEAM_ID && APNS_KEY_ID && APNS_BUNDLE_ID && APNS_PRIVATE_KEY_BASE64);
-}
-
-function apnsToken() {
-  // JWT pour APNS
-  const privateKey = Buffer.from(APNS_PRIVATE_KEY_BASE64, 'base64').toString('utf8');
-  return jwt.sign(
-    { iss: APNS_TEAM_ID, iat: Math.floor(Date.now() / 1000) },
-    privateKey,
-    { algorithm: 'ES256', header: { alg: 'ES256', kid: APNS_KEY_ID } }
-  );
-}
-
-// deviceToken: string (sans espaces)
-// payload: JSON object (alert, command, etc.)
-async function apnsSend(deviceToken, payload) {
-  if (!apnsIsConfigured()) throw new Error('APNS not configured');
-  const host = APNS_SANDBOX ? 'api.sandbox.push.apple.com' : 'api.push.apple.com';
-  const client = http2.connect(`https://${host}`);
-  const headers = {
-    ':method': 'POST',
-    ':path': `/3/device/${deviceToken}`,
-    'authorization': `bearer ${apnsToken()}`,
-    'apns-topic': APNS_BUNDLE_ID,
-    'apns-push-type': payload.command ? 'background' : 'alert',
-    'content-type': 'application/json',
-  };
-
-  return new Promise((resolve, reject) => {
-    const req = client.request(headers);
-    req.setEncoding('utf8');
-    let data = '';
-    req.on('response', (headers) => {
-      // collect if needed
-    });
-    req.on('data', (chunk) => { data += chunk; });
-    req.on('end', () => {
-      client.close();
-      if (data && data.includes('BadDeviceToken')) return reject(new Error('BadDeviceToken'));
-      resolve(data || '{}');
-    });
-    req.on('error', (err) => { client.close(); reject(err); });
-    req.end(JSON.stringify({ aps: { alert: payload.alert, sound: payload.sound ? 'default' : undefined, contentAvailable: payload.command ? 1 : 0 }, ...payload }));
-  });
-}
-
-// Push simple (notification)
-app.post('/notify', async (req, res) => {
-  const { deviceToken, title = 'Aurion', body = '', sound = true, extra = {} } = req.body || {};
-  if (!deviceToken) return res.status(400).json({ error: 'Missing deviceToken' });
-  if (!apnsIsConfigured()) return res.status(400).json({ error: 'APNS not configured' });
-
-  try {
-    const result = await apnsSend(deviceToken, { alert: { title, body }, sound, ...extra });
-    return res.json({ ok: true, result });
-  } catch (e) {
-    return res.status(502).json({ error: 'APNS error', detail: String(e) });
-  }
+// — Switch modèle
+app.post('/set_model', (req, res) => {
+  const { model } = req.body || {};
+  if (!model || typeof model !== 'string') return res.status(400).json({ error: 'Missing model' });
+  process.env.AURION_MODEL = model;
+  res.json({ ok: true, model });
 });
 
-// Commande téléphone (ton app iOS exécute)
-// body: { deviceToken, type, args? }
-// Exemples de type: "open_app", "call_contact", "reminder", "navigate", "home_action", "say"
-// Ta logique côté app doit gérer ces types et exécuter localement.
-app.post('/phone_command', async (req, res) => {
-  const { deviceToken, type, args = {} } = req.body || {};
-  if (!deviceToken || !type) return res.status(400).json({ error: 'Missing deviceToken or type' });
-  if (!apnsIsConfigured()) return res.status(400).json({ error: 'APNS not configured' });
-
-  const payload = {
-    command: { type, args, ts: nowParis() },
-    // Optionnel: message visible
-    alert: { title: 'Aurion', body: `Commande: ${type}` },
-    sound: false
-  };
-
-  try {
-    const result = await apnsSend(deviceToken, payload);
-    return res.json({ ok: true, result });
-  } catch (e) {
-    return res.status(502).json({ error: 'APNS error', detail: String(e) });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Start
-// ─────────────────────────────────────────────────────────────────────────────
+// — Start
 app.listen(PORT, () => {
-  log(`Aurion proxy running → http://localhost:${PORT} | model=${getCurrentModel()}`);
+  console.log(`${new Date().toISOString()} - Aurion proxy v1.2 (factual) → http://localhost:${PORT} | model=${AURION_MODEL}`);
 });
