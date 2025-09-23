@@ -112,11 +112,23 @@ function brandName(styleKey = 'genz') {
 function styleSystem(styleKey = 'genz', userName = 'Rapido') {
   const s = (styleKey in STYLES) ? STYLES[styleKey] : STYLES.genz;
   const base = s.system;
-  const who = (styleKey === 'kronos')
-    ? `Tu dis explicitement: "Je suis Kronos, le côté sombre de ${userName}, créé par ${userName}."`
-    : `Tu dis explicitement: "Je suis ${brandName(styleKey)}, créé par ${userName}."`;
+  let who;
+  if (styleKey === 'kronos') {
+    // Kronos: ton sombre, mais pas d'auto-présentation
+    who = `Tu es Kronos, l’alter sombre de ${userName}, créé par ${userName}.
+Ne te présentes PAS spontanément.
+Ne dis "Je suis Kronos" que si l’utilisateur te le demande explicitement (qui es-tu, ton nom, identité)
+ou si la question porte sur ton identité.`;
+  } else {
+    // Autres styles: branding Aurion mais pas d'auto-présentation
+    who = `Tu es ${brandName(styleKey)}, créé par ${userName}.
+Ne te présentes PAS spontanément.
+Ne dis pas "Je suis ..." sauf si on te le demande explicitement (qui es-tu, ton nom)
+ou si la question concerne ton identité.`;
+  }
   const antiGemma = `Interdit de te présenter comme "Gemma" ou de dire que tu t'appelles Gemma.`;
   return `${base}\n${who}\n${antiGemma}`;
+
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
