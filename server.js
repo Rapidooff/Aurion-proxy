@@ -14,8 +14,9 @@ const PORT = Number(process.env.PORT || 3000);
 
 // Ollama
 const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://127.0.0.1:11434';
-const AURION_MODEL_PRIMARY   = process.env.AURION_MODEL_PRIMARY   || 'aurion-llama31-fast';
-const AURION_MODEL_SECONDARY = process.env.AURION_MODEL_SECONDARY || 'phi:latest';
+const AURION_MODEL_PRIMARY   = process.env.AURION_MODEL_PRIMARY   || 'aurion-gemma';
+const AURION_MODEL_SECONDARY = process.env.AURION_MODEL_SECONDARY || 'aurion-phi';
+
 
 // Embeddings + Web search (optionnel)
 const EMBED_MODEL    = process.env.EMBED_MODEL || 'nomic-embed-text';
@@ -31,7 +32,7 @@ const ENABLE_SUGGESTIONS      = String(process.env.ENABLE_SUGGESTIONS || 'false'
 
 // LLM tuning
 const LLM_NUM_CTX     = Number(process.env.LLM_NUM_CTX || 8192);
-const LLM_NUM_PREDICT = Number(process.env.LLM_NUM_PREDICT || 768);
+const LLM_NUM_PREDICT = Number(process.env.LLM_NUM_PREDICT || 1024);
 const LLM_TEMPERATURE = Number(process.env.LLM_TEMPERATURE || 0.5);
 
 // Modèles nommés
@@ -49,6 +50,22 @@ function chooseModel(hint, style) {
 
 // ──────────────────────────────────────────────────────────────────────────────
 const app = express();
+// Log cible Ollama (utile en debug)
+console.log(`[BOOT] OLLAMA_HOST = ${OLLAMA_HOST}`);
+
+// Ping des modèles Ollama
+app.get('/ollama/health', async (_req, res) => {
+  try {
+    const r = await fetch(`${OLLAMA_HOST}/api/tags`);
+    const data = await r.json().catch(() => null);
+    if (!r.ok) {
+      return res.status(502).json({ ok: false, status: r.status, host: OLLAMA_HOST, error: 'upstream_not_ok' });
+    }
+    return res.json({ ok: true, host: OLLAMA_HOST, models: data?.models ?? data });
+  } catch (e) {
+    return res.status(500).json({ ok: false, host: OLLAMA_HOST, error: String(e?.message || e) });
+  }
+});
 app.use(cors({ origin: '*', credentials: false }));
 app.use(express.json({ limit: '1mb' }));
 app.use((req, _res, next) => { console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`); next(); });
